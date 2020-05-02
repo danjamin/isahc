@@ -6,6 +6,7 @@ use crate::{
     config::internal::{ConfigurableBase, SetOpt},
     config::*,
     handler::{RequestHandler, ResponseBodyReader},
+    interceptors::{self, Interceptor},
     middleware::Middleware,
     task::Join,
     Body, Error,
@@ -62,6 +63,7 @@ lazy_static! {
 pub struct HttpClientBuilder {
     agent_builder: AgentBuilder,
     defaults: http::Extensions,
+    interceptors: Vec<Box<dyn Interceptor>>,
     middleware: Vec<Box<dyn Middleware>>,
     default_headers: HeaderMap<HeaderValue>,
     error: Option<Error>,
@@ -90,6 +92,7 @@ impl HttpClientBuilder {
         Self {
             agent_builder: AgentBuilder::default(),
             defaults,
+            interceptors: Vec::new(),
             middleware: Vec::new(),
             default_headers: HeaderMap::new(),
             error: None,
@@ -105,6 +108,12 @@ impl HttpClientBuilder {
     #[cfg(feature = "cookies")]
     pub fn cookies(self) -> Self {
         self.middleware_impl(crate::cookies::CookieJar::default())
+    }
+
+    /// Add a request interceptor to the client.
+    pub fn interceptor(mut self, interceptor: impl Interceptor) -> Self {
+        self.interceptors.push(Box::new(interceptor));
+        self
     }
 
     /// Add a middleware layer to the client.
@@ -377,6 +386,7 @@ impl HttpClientBuilder {
         Ok(HttpClient {
             agent: Arc::new(self.agent_builder.spawn()?),
             defaults: self.defaults,
+            interceptors: self.interceptors,
             middleware: self.middleware,
             default_headers: self.default_headers,
         })
@@ -489,9 +499,14 @@ impl<'a, K: Copy, V: Copy> HeaderPair<K, V> for &'a (K, V) {
 pub struct HttpClient {
     /// This is how we talk to our background agent thread.
     agent: Arc<agent::Handle>,
+
     /// Map of config values that should be used to configure execution if not
     /// specified in a request.
     defaults: http::Extensions,
+
+    /// Registered interceptors that requests should pass through.
+    interceptors: Vec<Box<dyn Interceptor>>,
+
     /// Any middleware implementations that requests should pass through.
     middleware: Vec<Box<dyn Middleware>>,
     /// Default headers to add to every request.
