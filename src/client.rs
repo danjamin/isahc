@@ -6,8 +6,7 @@ use crate::{
     config::internal::{ConfigurableBase, SetOpt},
     config::*,
     handler::{RequestHandler, ResponseBodyReader},
-    interceptors::{self, Interceptor},
-    middleware::Middleware,
+    interceptors::{self, Interceptor, InterceptorObj},
     task::Join,
     Body, Error,
 };
@@ -63,8 +62,7 @@ lazy_static! {
 pub struct HttpClientBuilder {
     agent_builder: AgentBuilder,
     defaults: http::Extensions,
-    interceptors: Vec<Box<dyn Interceptor>>,
-    middleware: Vec<Box<dyn Middleware>>,
+    interceptors: Vec<InterceptorObj<'static>>,
     default_headers: HeaderMap<HeaderValue>,
     error: Option<Error>,
 }
@@ -93,7 +91,6 @@ impl HttpClientBuilder {
             agent_builder: AgentBuilder::default(),
             defaults,
             interceptors: Vec::new(),
-            middleware: Vec::new(),
             default_headers: HeaderMap::new(),
             error: None,
         }
@@ -107,31 +104,26 @@ impl HttpClientBuilder {
     /// feature is enabled.
     #[cfg(feature = "cookies")]
     pub fn cookies(self) -> Self {
-        self.middleware_impl(crate::cookies::CookieJar::default())
+        self.interceptor(crate::cookies::CookieJar::default())
     }
 
-    // #[cfg(feature = "unstable-interceptor")]
     /// Add a request interceptor to the client.
-    pub fn interceptor(mut self, interceptor: impl Interceptor) -> Self {
-        self.interceptors.push(Box::new(interceptor));
-        self
-    }
-
-    /// Add a middleware layer to the client.
     ///
     /// # Availability
     ///
     /// This method is only available when the
-    /// [`middleware-api-preview`](index.html#middleware-api-preview) feature is
+    /// [`unstable-interceptors`](index.html#unstable-interceptors) feature is
     /// enabled.
-    #[cfg(feature = "middleware-api-preview")]
-    pub fn middleware(self, middleware: impl Middleware) -> Self {
-        self.middleware_impl(middleware)
+    #[cfg(feature = "unstable-interceptors")]
+    pub fn interceptor(mut self, interceptor: impl Interceptor + 'static) -> Self {
+        self.interceptors.push(InterceptorObj::new(interceptor));
+        self
     }
 
+    #[cfg(not(feature = "unstable-interceptors"))]
     #[allow(unused)]
-    fn middleware_impl(mut self, middleware: impl Middleware) -> Self {
-        self.middleware.push(Box::new(middleware));
+    pub(crate) fn interceptor(mut self, interceptor: impl Interceptor + 'static) -> Self {
+        self.interceptors.push(InterceptorObj::new(interceptor));
         self
     }
 
@@ -388,7 +380,6 @@ impl HttpClientBuilder {
             agent: Arc::new(self.agent_builder.spawn()?),
             defaults: self.defaults,
             interceptors: self.interceptors,
-            middleware: self.middleware,
             default_headers: self.default_headers,
         })
     }
@@ -506,10 +497,8 @@ pub struct HttpClient {
     defaults: http::Extensions,
 
     /// Registered interceptors that requests should pass through.
-    interceptors: Vec<Box<dyn Interceptor>>,
+    interceptors: Vec<InterceptorObj<'static>>,
 
-    /// Any middleware implementations that requests should pass through.
-    middleware: Vec<Box<dyn Middleware>>,
     /// Default headers to add to every request.
     default_headers: HeaderMap<HeaderValue>,
 }
@@ -816,16 +805,13 @@ impl HttpClient {
             uri = ?request.uri(),
         );
 
-        let client = self;
-
-        let mut cx = interceptors::Context {
+        let cx = interceptors::Context {
             invoker: Arc::new(move |mut request| {
-                // let span = span;
                 Box::pin(async move {
                     // We are checking here if header already contains the key, simply ignore it.
                     // In case the key wasn't present in parts.headers ensure that
                     // we have all the headers from default headers.
-                    for name in client.default_headers.keys() {
+                    for name in self.default_headers.keys() {
                         if !request.headers().contains_key(name) {
                             for v in self.default_headers.get_all(name).iter() {
                                 request.headers_mut().append(name, v.clone());
@@ -839,16 +825,11 @@ impl HttpClient {
                         .entry(http::header::USER_AGENT)
                         .or_insert(USER_AGENT.parse().unwrap());
 
-                    // Apply any request middleware, starting with the outermost one.
-                    for middleware in client.middleware.iter().rev() {
-                        request = middleware.filter_request(request);
-                    }
-
                     // Create and configure a curl easy handle to fulfil the request.
-                    let (easy, future) = client.create_easy_handle(request)?;
+                    let (easy, future) = self.create_easy_handle(request)?;
 
                     // Send the request to the agent to be executed.
-                    client.agent.submit_request(easy)?;
+                    self.agent.submit_request(easy)?;
 
                     // Await for the response headers.
                     let response = future.await?;
@@ -862,12 +843,12 @@ impl HttpClient {
                         .and_then(|v| v.parse().ok());
 
                     // Convert the reader into an opaque Body.
-                    let mut response = response.map(|reader| {
+                    Ok(response.map(|reader| {
                         let body = ResponseBody {
                             inner: reader,
                             // Extend the lifetime of the agent by including a reference
                             // to its handle in the response body.
-                            _agent: client.agent.clone(),
+                            _agent: self.agent.clone(),
                         };
 
                         if let Some(len) = content_length {
@@ -875,15 +856,7 @@ impl HttpClient {
                         } else {
                             Body::from_reader(body)
                         }
-                    });
-
-                    // Apply response middleware, starting with the innermost
-                    // one.
-                    for middleware in self.middleware.iter() {
-                        response = middleware.filter_response(response);
-                    }
-
-                    Ok(response)
+                    }))
                 }.instrument(span.clone()))
             }),
             interceptors: &self.interceptors,

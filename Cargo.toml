@@ -27,7 +27,7 @@ psl = ["parking_lot", "publicsuffix"]
 spnego = ["curl-sys/spnego"]
 static-curl = ["curl/static-curl"]
 text-decoding = ["encoding_rs", "mime"]
-middleware-api-preview = []
+unstable-interceptors = []
 
 [dependencies]
 bytes = "0.5"
